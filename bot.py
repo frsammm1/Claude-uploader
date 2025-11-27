@@ -6,7 +6,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 import asyncio
 from downloader import download_media
 from uploader import upload_media
-from link_parser import parse_links
+from link_extractor import parse_links
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 
