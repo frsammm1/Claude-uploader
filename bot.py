@@ -5,7 +5,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from motor.motor_asyncio import AsyncIOMotorClient
 import asyncio
 from downloader import download_media
-from uploader import upload_media
+from uploader import upload_media_batch
 from link_extractor import parse_links
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
@@ -52,13 +52,13 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Send TXT or HTML file only")
         return WAITING_FILE
     
-    logger.info(f"User {user_id} uploaded {doc.file_name}")
+    logger.info(f"Processing file: {doc.file_name}")
     
     file = await context.bot.get_file(doc.file_id)
     path = f"temp_{user_id}.txt"
     await file.download_to_drive(path)
     
-    with open(path, 'r', encoding='utf-8') as f:
+    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
         content = f.read()
     os.remove(path)
     
@@ -80,7 +80,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💬 Send extra caption or /skip"
     )
     
-    logger.info(f"Parsed {len(links)} links for user {user_id}")
+    logger.info(f"Detected {len(links)} links (Videos: {videos}, PDFs: {pdfs})")
     return WAITING_CAPTION
 
 async def handle_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -90,59 +90,58 @@ async def handle_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
     links = user_data[user_id]['links']
     stop_flags[user_id] = False
     
-    keyboard = [[InlineKeyboardButton("⏹️ STOP", callback_data=f"stop_{user_id}")]]
+    keyboard = [[InlineKeyboardButton("⏹️ STOP ALL", callback_data=f"stop_{user_id}")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    control_msg = await update.message.reply_text("🚀 Starting downloads...", reply_markup=reply_markup)
+    control_msg = await update.message.reply_text("🚀 Starting batch processing...", reply_markup=reply_markup)
     
     success_count = 0
     failed_count = 0
+    downloaded_files = []
     
+    # Download all first
     for idx, item in enumerate(links, 1):
         if stop_flags.get(user_id, False):
-            await control_msg.edit_text("⏹️ Stopped by user")
             break
         
-        status = await update.message.reply_text(f"📥 [{idx}/{len(links)}] Starting download...")
+        status = await update.message.reply_text(f"📥 [{idx}/{len(links)}] Downloading...\n{item['caption'][:50]}")
         
         try:
             logger.info(f"[{idx}/{len(links)}] Downloading: {item['url']}")
             
             file_path = await download_media(item['url'], item['type'], status, context.bot, user_id)
             
-            if stop_flags.get(user_id, False):
-                await status.delete()
-                break
-            
-            if not file_path:
-                await status.edit_text(f"❌ [{idx}/{len(links)}] Download failed\n{item['caption'][:50]}")
-                failed_count += 1
-                logger.error(f"Download failed: {item['url']}")
-                continue
-            
-            caption = f"{item['caption']}\n\n{extra_caption}".strip() if extra_caption else item['caption']
-            
-            logger.info(f"[{idx}/{len(links)}] Uploading: {file_path}")
-            await status.edit_text(f"📤 [{idx}/{len(links)}] Uploading...")
-            
-            success = await upload_media(file_path, item['type'], caption, update.effective_chat.id, context.bot, status, user_id)
-            
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            
-            if success:
-                await status.edit_text(f"✅ [{idx}/{len(links)}] Done!")
-                success_count += 1
-                logger.info(f"[{idx}/{len(links)}] Success!")
+            if file_path and os.path.exists(file_path):
+                downloaded_files.append({
+                    'file': file_path,
+                    'type': item['type'],
+                    'caption': f"{item['caption']}\n\n{extra_caption}".strip() if extra_caption else item['caption'],
+                    'index': idx
+                })
+                await status.edit_text(f"✅ [{idx}/{len(links)}] Downloaded")
+                logger.info(f"[{idx}/{len(links)}] Success: {file_path}")
             else:
-                await status.edit_text(f"❌ [{idx}/{len(links)}] Upload failed")
+                await status.edit_text(f"❌ [{idx}/{len(links)}] Failed")
                 failed_count += 1
-                logger.error(f"Upload failed: {file_path}")
+                logger.error(f"[{idx}/{len(links)}] Download failed")
                 
         except Exception as e:
-            logger.error(f"Error processing {item['url']}: {e}")
-            await status.edit_text(f"❌ [{idx}/{len(links)}] Error: {str(e)[:50]}")
+            logger.error(f"[{idx}/{len(links)}] Error: {e}")
+            await status.edit_text(f"❌ [{idx}/{len(links)}] Error")
             failed_count += 1
+    
+    # Upload all in batch
+    if downloaded_files and not stop_flags.get(user_id, False):
+        await control_msg.edit_text("📤 Uploading all files...")
+        
+        uploaded = await upload_media_batch(downloaded_files, update.effective_chat.id, context.bot, user_id)
+        success_count = uploaded
+        failed_count += len(downloaded_files) - uploaded
+        
+        # Cleanup
+        for item in downloaded_files:
+            if os.path.exists(item['file']):
+                os.remove(item['file'])
     
     summary = (
         f"✅ Complete!\n\n"
@@ -153,10 +152,12 @@ async def handle_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await control_msg.edit_text(summary)
     
-    del user_data[user_id]
-    del stop_flags[user_id]
+    if user_id in user_data:
+        del user_data[user_id]
+    if user_id in stop_flags:
+        del stop_flags[user_id]
     
-    logger.info(f"User {user_id} completed: {success_count} success, {failed_count} failed")
+    logger.info(f"Completed: {success_count} success, {failed_count} failed")
     
     return ConversationHandler.END
 
@@ -168,7 +169,7 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stop_flags[user_id] = True
     
     await query.edit_message_text("⏹️ Stopping...")
-    logger.info(f"User {user_id} stopped the process")
+    logger.info(f"User {user_id} stopped")
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -193,7 +194,7 @@ def main():
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(stop_callback, pattern='^stop_'))
     
-    logger.info("Bot started successfully!")
+    logger.info("Bot started!")
     app.run_polling()
 
 if __name__ == '__main__':
