@@ -1,76 +1,150 @@
 import re
 from bs4 import BeautifulSoup
+import logging
+
+logger = logging.getLogger(__name__)
 
 def parse_links(content):
+    """Parse all video and PDF links from content"""
     links = []
     seen = set()
     
-    # Try HTML first
+    # Try HTML parsing first
     try:
         soup = BeautifulSoup(content, 'html.parser')
         for a in soup.find_all('a', href=True):
-            url = a['href']
+            url = a['href'].strip()
             caption = a.get_text(strip=True)
             
-            if url not in seen and is_valid_url(url):
-                links.append({
-                    'url': url,
-                    'type': get_type(url),
-                    'caption': caption
-                })
-                seen.add(url)
-    except:
-        pass
+            if url and url not in seen and is_valid_url(url):
+                link_type = get_type(url)
+                if link_type:
+                    links.append({
+                        'url': url,
+                        'type': link_type,
+                        'caption': caption or 'No title'
+                    })
+                    seen.add(url)
+                    logger.info(f"Found link: {caption} - {url}")
+    except Exception as e:
+        logger.error(f"HTML parsing error: {e}")
     
-    # Text parsing
+    # Text parsing - more aggressive
     if not links:
         lines = content.split('\n')
         for line in lines:
             line = line.strip()
-            if not line:
+            if not line or len(line) < 10:
                 continue
             
-            # Get caption
+            # Extract caption
             caption = ""
+            search_text = line
+            
             if ':' in line:
                 parts = line.split(':', 1)
                 caption = parts[0].strip()
                 search_text = parts[1]
-            else:
-                search_text = line
+            elif '|' in line:
+                parts = line.split('|', 1)
+                caption = parts[0].strip()
+                search_text = parts[1]
             
-            # Find URLs
-            urls = re.findall(r'https?://[^\s<>"]+', search_text)
+            # Find all URLs - more patterns
+            url_patterns = [
+                r'https?://[^\s<>"]+',
+                r'www\.[^\s<>"]+',
+            ]
+            
+            urls = []
+            for pattern in url_patterns:
+                found = re.findall(pattern, search_text)
+                urls.extend(found)
             
             for url in urls:
-                url = url.rstrip('.,;:!?)')
+                # Clean URL
+                url = url.rstrip('.,;:!?)\'"')
+                url = url.split()[0]  # Take first part if space
                 
-                if url not in seen and is_valid_url(url):
-                    links.append({
-                        'url': url,
-                        'type': get_type(url),
-                        'caption': caption
-                    })
-                    seen.add(url)
+                # Add http if missing
+                if url.startswith('www.'):
+                    url = 'https://' + url
+                
+                if url and url not in seen and is_valid_url(url):
+                    link_type = get_type(url)
+                    if link_type:
+                        links.append({
+                            'url': url,
+                            'type': link_type,
+                            'caption': caption or 'No title'
+                        })
+                        seen.add(url)
+                        logger.info(f"Found link: {caption} - {url}")
     
+    logger.info(f"Total links parsed: {len(links)}")
     return links
 
 def is_valid_url(url):
-    return url.startswith('http') and len(url) > 10
+    """Check if URL is valid"""
+    if not url or len(url) < 10:
+        return False
+    
+    if not (url.startswith('http://') or url.startswith('https://')):
+        return False
+    
+    # Check for common patterns
+    invalid_patterns = ['javascript:', 'mailto:', 'tel:', '#', 'data:']
+    for pattern in invalid_patterns:
+        if pattern in url.lower():
+            return False
+    
+    return True
 
 def get_type(url):
+    """Determine if URL is video or PDF"""
     url_lower = url.lower()
     
-    video_exts = ['.mp4', '.mkv', '.avi', '.mov', '.flv', '.webm', '.m3u8']
-    if any(ext in url_lower for ext in video_exts):
-        return 'video'
+    # Video extensions
+    video_exts = [
+        '.mp4', '.mkv', '.avi', '.mov', '.flv', 
+        '.webm', '.m3u8', '.ts', '.3gp', '.wmv'
+    ]
     
+    for ext in video_exts:
+        if ext in url_lower:
+            return 'video'
+    
+    # PDF
     if '.pdf' in url_lower:
         return 'pdf'
     
-    # Check domain patterns
-    video_patterns = ['video', 'stream', 'hls', 'master', 'playlist', 'hranker', 'amazonaws']
-    if any(p in url_lower for p in video_patterns):
-        return 'video'
+    # Domain and path patterns for videos
+    video_indicators = [
+        'video', 'stream', 'hls', 'master', 'playlist',
+        'hranker', 'amazonaws', 'cloudflare', 'cdn',
+        'mp4', 'mkv', 'watch', 'play', 'embed',
+        '/v/', '/videos/', '/media/'
+    ]
     
-    return 'pdf'
+    for indicator in video_indicators:
+        if indicator in url_lower:
+            return 'video'
+    
+    # PDF indicators
+    pdf_indicators = ['pdf', 'document', 'docs', 'files']
+    for indicator in pdf_indicators:
+        if indicator in url_lower:
+            return 'pdf'
+    
+    # Default to video for media platforms
+    media_domains = [
+        'youtube.com', 'youtu.be', 'vimeo.com', 'dailymotion.com',
+        'streamable.com', 'vidyard.com', 'wistia.com', 'brightcove.com',
+        'jwplayer.com', 'cloudflare.com', 'amazonaws.com', 'hranker.com'
+    ]
+    
+    for domain in media_domains:
+        if domain in url_lower:
+            return 'video'
+    
+    return None
